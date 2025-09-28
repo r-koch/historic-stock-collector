@@ -55,12 +55,10 @@ public class HistoricStockCollector {
           }
         }
       } catch (LimitExceededException e) {
-        saveState(map);
-        System.out.println("save partial");
+        // TODO save data to local file?
+        e.printStackTrace();
       }
     }
-    saveState(map);
-    System.out.println("save all");
     try {
       for (List<StockRecord> records : map.values()) {
         insert(records.getFirst().getLocalDate(), records);
