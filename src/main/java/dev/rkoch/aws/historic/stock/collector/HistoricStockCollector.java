@@ -1,15 +1,17 @@
 package dev.rkoch.aws.historic.stock.collector;
 
+import java.io.BufferedWriter;
 import java.io.IOException;
-import java.io.ObjectOutputStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardOpenOption;
 import java.time.LocalDate;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import javax.naming.LimitExceededException;
+import dev.rkoch.aws.collector.utils.State;
 import dev.rkoch.aws.s3.parquet.S3Parquet;
 import dev.rkoch.aws.stock.collector.StockRecord;
 import dev.rkoch.aws.stock.collector.Symbols;
@@ -22,61 +24,110 @@ public class HistoricStockCollector {
   private static final String PARQUET_KEY = "raw/stock/localDate=%s/data.parquet";
 
   public static void main(String[] args) {
-    new HistoricStockCollector().collect();
+    HistoricStockCollector collector = new HistoricStockCollector();
+    // collector.collect();
+    collector.store();
+  }
+
+  private void store() {
+    List<StockRecord> stockRecords = read(Path.of(System.getProperty("user.dir"), "data.txt"));
+    Map<LocalDate, Map<String, StockRecord>> map = toMap(stockRecords);
+    try (State state = new State()) {
+      LocalDate date = state.getAvStartDate();
+      LocalDate endDate = state.getNasdaqStartDate();
+      for (; date.isBefore(endDate); date = date.plusDays(1)) {
+        Map<String, StockRecord> map2 = map.get(date);
+        if (map2 != null) {
+          List<StockRecord> records = new ArrayList<>();
+          for (String symbol : Symbols.get()) {
+            StockRecord stockRecord = map2.get(symbol);
+            if (stockRecord == null) {
+              stockRecord = StockRecord.of(date, symbol, 0, 0, 0, 0, 0);
+            }
+            records.add(stockRecord);
+          }
+          insert(date, records);
+        }
+      }
+    }
+  }
+
+  private Map<LocalDate, Map<String, StockRecord>> toMap(List<StockRecord> stockRecords) {
+    Map<LocalDate, Map<String, StockRecord>> map = new HashMap<>();
+    for (StockRecord stockRecord : stockRecords) {
+      Map<String, StockRecord> dateMap = map.get(stockRecord.getLocalDate());
+      if (dateMap == null) {
+        dateMap = new HashMap<>();
+      }
+      dateMap.put(stockRecord.getId(), stockRecord);
+      map.put(stockRecord.getLocalDate(), dateMap);
+    }
+    return map;
+  }
+
+  private List<StockRecord> read(Path path) {
+    try {
+      List<String> lines = Files.readAllLines(path);
+      List<StockRecord> records = new ArrayList<>(lines.size());
+      for (String line : lines) {
+        String[] split = line.split(";");
+        records.add(StockRecord.of(LocalDate.parse(split[0]), split[1], split[2], split[3], split[4], split[5], split[6]));
+      }
+      return records;
+    } catch (IOException e) {
+      throw new RuntimeException(e);
+    }
   }
 
   private AlphaVantageApi alphaVantageApi;
 
   private S3Parquet s3Parquet;
 
+  private State state;
+
+  private State getState() {
+    if (state == null) {
+      state = new State();
+    }
+    return state;
+  }
+
   public HistoricStockCollector() {
 
   }
 
   public void collect() {
-    collect(Symbols.get());
+    String symbol = getState().getLastProcessedStock();
+    collect(Symbols.getAfter(symbol));
   }
 
   private void collect(final List<String> symbols) {
-    LocalDate avEndDate = LocalDate.parse(Variable.DATE_START_NQ.get());
-    Map<LocalDate, List<StockRecord>> map = new HashMap<>();
-
-    for (String symbol : symbols) {
-      try {
-        for (StockRecord stockRecord : getAlphaVantageApi().getData(symbol)) {
-          LocalDate localDate = stockRecord.getLocalDate();
-          if (localDate.isBefore(avEndDate)) {
-            List<StockRecord> records = map.get(localDate);
-            if (records == null) {
-              records = new ArrayList<>();
-            }
-            records.add(stockRecord);
-            map.put(localDate, records);
-          }
+    try (State state = getState()) {
+      for (String symbol : symbols) {
+        try {
+          List<StockRecord> records = getAlphaVantageApi().getData(symbol);
+          write(records);
+          System.out.println("written %s".formatted(symbol));
+          state.setLastProcessedStock(symbol);
+        } catch (LimitExceededException e) {
+          System.out.println("limit exceeded");
+          return;
         }
-      } catch (LimitExceededException e) {
-        // TODO save data to local file?
-        e.printStackTrace();
       }
-    }
-    try {
-      for (List<StockRecord> records : map.values()) {
-        insert(records.getFirst().getLocalDate(), records);
-      }
-    } catch (Exception e) {
-      e.printStackTrace();
     }
   }
 
-  private void saveState(Map<LocalDate, List<StockRecord>> map) {
+  private void write(List<StockRecord> records) {
     try {
-      Path tempFile = Files.createTempFile(null, null);
-      try (ObjectOutputStream outputstream = new ObjectOutputStream(Files.newOutputStream(tempFile))) {
-        outputstream.writeObject(map);
-        System.out.println(tempFile.toString());
+      Path file = Path.of(System.getProperty("user.dir"), "data.txt");
+      try (BufferedWriter writer = Files.newBufferedWriter(file, StandardOpenOption.CREATE, StandardOpenOption.APPEND)) {
+        for (StockRecord record : records) {
+          writer.write(record.toString());
+          writer.newLine();
+        }
       }
-    } catch (IOException e1) {
-      e1.printStackTrace();
+    } catch (IOException e) {
+      e.printStackTrace();
     }
   }
 
@@ -94,8 +145,13 @@ public class HistoricStockCollector {
     return s3Parquet;
   }
 
-  private void insert(final LocalDate date, final List<StockRecord> records) throws Exception {
-    getS3Parquet().write(BUCKET_NAME, PARQUET_KEY.formatted(date), records);
+  private void insert(final LocalDate date, final List<StockRecord> records) {
+    try {
+      getS3Parquet().write(BUCKET_NAME, PARQUET_KEY.formatted(date), records, new StockRecord().getDehydrator());
+      System.out.println("%s inserted".formatted(date));
+    } catch (Exception e) {
+      e.printStackTrace();
+    }
   }
 
 }

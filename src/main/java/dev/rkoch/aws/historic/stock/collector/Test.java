@@ -9,7 +9,7 @@ public class Test {
 
   public static void main(String[] args) throws Exception {
     new S3Parquet().write("dev-rkoch-spre-test", "blub/LocalDate=%s/data.parquet".formatted(LocalDate.now()),
-        List.of(StockRecord.of(LocalDate.now(), "test", 0, 0, 0, 0, 0)));
+        List.of(StockRecord.of(LocalDate.now(), "test", 0, 0, 0, 0, 0)), new StockRecord().getDehydrator());
   }
 
 }
